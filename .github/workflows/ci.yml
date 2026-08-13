@@ -1,4 +1,12 @@
-# Placeholder — regression suite wired in Stage 2 Step 6.
+# Stage 2 Step 6 — the real CI/CD gate: runs the golden dataset + regression suite
+# (non-real-API cases) on every push/PR. Binary pass/fail — pytest's own exit code
+# fails the step (and therefore the job) on any single test failure; nothing here
+# pipes that exit code through another command that could mask it. No coverage
+# threshold or partial-credit logic — this system produces pass/fail test results,
+# not a scored output, so that class of gate doesn't apply. Postgres setup is the
+# exact same recipe as drift-check.yml (itself mirroring scripts/run_ci_tests.sh) —
+# same throwaway tmpfs container, same credentials, same migration invocation, not
+# reinvented a third time.
 name: CI
 
 on:
@@ -11,8 +19,8 @@ jobs:
     # Defensive guard (Stage 2 Step 5): this workflow's own `on:` block has no
     # `schedule:` trigger, so drift-check.yml's weekly cron cannot actually fire this
     # job today — separate workflow files don't share trigger scope in GitHub Actions.
-    # Kept here so this placeholder doesn't start firing weekly-for-no-reason if a
-    # schedule trigger is ever added to this file's own `on:` block later.
+    # Kept here so this job doesn't start firing weekly-for-no-reason if a schedule
+    # trigger is ever added to this file's own `on:` block later.
     if: github.event_name != 'schedule'
     steps:
       - name: Checkout repo
@@ -23,5 +31,56 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install .
+      - name: Install dependencies (incl. dev extras for pytest)
+        run: pip install ".[dev]"
+
+      - name: Start ephemeral tmpfs Postgres (same recipe as drift-check.yml)
+        run: |
+          set -euo pipefail
+          docker run -d --name ci_postgres \
+            -e POSTGRES_USER=llm_wiki_admin \
+            -e POSTGRES_PASSWORD=ci-admin-password \
+            -e POSTGRES_DB=llm_wiki \
+            -p 55432:5432 \
+            --tmpfs /var/lib/postgresql/data \
+            postgres:16 \
+            -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+
+          echo "waiting for postgres to accept connections..."
+          for _ in $(seq 1 30); do
+            if docker exec ci_postgres pg_isready -U llm_wiki_admin >/dev/null 2>&1; then
+              echo "postgres ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not become ready in time" >&2
+          docker logs ci_postgres >&2 || true
+          exit 1
+
+      - name: Run alembic migrations (creates schema + restricted role + grants)
+        env:
+          DATABASE_ADMIN_URL: postgresql+asyncpg://llm_wiki_admin:ci-admin-password@localhost:55432/llm_wiki
+          DATABASE_URL: postgresql+asyncpg://llm_wiki_app:ci-app-password@localhost:55432/llm_wiki
+        run: python -m alembic upgrade head
+
+      # RUN_GRAPH_INTEGRATION_TESTS deliberately left unset — case 5 (the real
+      # Anthropic API case) stays skipped, same scope/reasoning as drift-check.yml.
+      # No secret needed: LLM_API_KEY below is a placeholder string, matching the
+      # local scripts/run_ci_tests.sh convention. Binary gate: pytest's exit code IS
+      # this step's exit code — not piped through tee/anything else that could mask
+      # a non-zero exit, so a single failing test fails this step and the job.
+      - name: Run golden dataset + regression suite (non-real-API cases)
+        env:
+          DATABASE_ADMIN_URL: postgresql+asyncpg://llm_wiki_admin:ci-admin-password@localhost:55432/llm_wiki
+          DATABASE_URL: postgresql+asyncpg://llm_wiki_app:ci-app-password@localhost:55432/llm_wiki
+          QDRANT_URL: http://127.0.0.1:1
+          LLM_API_KEY: ci-test-key-not-used
+          DEAD_LETTER_PATH: /tmp/ci-dead-letter
+        run: |
+          mkdir -p "$DEAD_LETTER_PATH"
+          python -m pytest tests/test_golden_dataset.py tests/test_regression_suite.py -v
+
+      - name: Stop Postgres
+        if: always()
+        run: docker rm -f ci_postgres || true
