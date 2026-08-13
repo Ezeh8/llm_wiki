@@ -1,0 +1,99 @@
+# Stage 2 Step 5 — weekly drift check. Runs the golden dataset's 7 non-real-API cases
+# on a schedule to catch regressions in the system's core behaviors independent of any
+# single push/PR. Postgres setup (container image/flags, admin+app credentials,
+# migration invocation) deliberately mirrors scripts/run_ci_tests.sh line-for-line
+# rather than reinventing it or switching to GitHub Actions' native `services:` block —
+# see that script's own header comment for why a real (if throwaway, tmpfs-backed)
+# Postgres is used instead of a substitute like SQLite. Not invoked directly because
+# it hardcodes tests/test_endpoints.py as its target; this job needs
+# tests/test_golden_dataset.py only.
+name: Drift Check
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Monday 09:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (incl. dev extras for pytest)
+        run: pip install ".[dev]"
+
+      - name: Start ephemeral tmpfs Postgres (same recipe as scripts/run_ci_tests.sh)
+        run: |
+          set -euo pipefail
+          docker run -d --name drift_check_postgres \
+            -e POSTGRES_USER=llm_wiki_admin \
+            -e POSTGRES_PASSWORD=ci-admin-password \
+            -e POSTGRES_DB=llm_wiki \
+            -p 55432:5432 \
+            --tmpfs /var/lib/postgresql/data \
+            postgres:16 \
+            -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+
+          echo "waiting for postgres to accept connections..."
+          for _ in $(seq 1 30); do
+            if docker exec drift_check_postgres pg_isready -U llm_wiki_admin >/dev/null 2>&1; then
+              echo "postgres ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not become ready in time" >&2
+          docker logs drift_check_postgres >&2 || true
+          exit 1
+
+      - name: Run alembic migrations (creates schema + restricted role + grants)
+        env:
+          DATABASE_ADMIN_URL: postgresql+asyncpg://llm_wiki_admin:ci-admin-password@localhost:55432/llm_wiki
+          DATABASE_URL: postgresql+asyncpg://llm_wiki_app:ci-app-password@localhost:55432/llm_wiki
+        run: python -m alembic upgrade head
+
+      # RUN_GRAPH_INTEGRATION_TESTS deliberately left unset — case 5 (the real
+      # Anthropic API case) stays skipped, matching today's local default. No secret
+      # is needed anywhere in this job: LLM_API_KEY below is a placeholder string,
+      # never read by any code path that actually runs with it unset for real calls.
+      - name: Run golden dataset (7 non-real-API cases)
+        env:
+          DATABASE_ADMIN_URL: postgresql+asyncpg://llm_wiki_admin:ci-admin-password@localhost:55432/llm_wiki
+          DATABASE_URL: postgresql+asyncpg://llm_wiki_app:ci-app-password@localhost:55432/llm_wiki
+          QDRANT_URL: http://127.0.0.1:1
+          LLM_API_KEY: ci-test-key-not-used
+          DEAD_LETTER_PATH: /tmp/drift-check-dead-letter
+        run: |
+          set -eo pipefail
+          mkdir -p "$DEAD_LETTER_PATH"
+          python -m pytest tests/test_golden_dataset.py -v --junitxml=drift-check-junit.xml \
+            2>&1 | tee drift-check-output.txt
+
+      - name: Stop Postgres
+        if: always()
+        run: docker rm -f drift_check_postgres || true
+
+      - name: Compute run date for artifact naming
+        if: always()
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Named with both the run date AND the unique run id so a manual
+      # workflow_dispatch run on the same day as the scheduled run never overwrites
+      # the other's artifact.
+      - name: Upload timestamped results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-check-results-${{ steps.date.outputs.date }}-${{ github.run_id }}
+          path: |
+            drift-check-junit.xml
+            drift-check-output.txt
+          retention-days: 90

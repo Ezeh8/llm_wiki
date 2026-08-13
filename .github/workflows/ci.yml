@@ -8,6 +8,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Defensive guard (Stage 2 Step 5): this workflow's own `on:` block has no
+    # `schedule:` trigger, so drift-check.yml's weekly cron cannot actually fire this
+    # job today — separate workflow files don't share trigger scope in GitHub Actions.
+    # Kept here so this placeholder doesn't start firing weekly-for-no-reason if a
+    # schedule trigger is ever added to this file's own `on:` block later.
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
