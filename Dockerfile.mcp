@@ -1,0 +1,32 @@
+# MCP server image — deliberately separate from Dockerfile (the main app), with its
+# own small, explicit dependency list rather than reusing pyproject.toml's full
+# `dependencies` (which includes sqlalchemy/torch/qdrant-client/etc. for the main
+# app). PRD Section 4 System Mapping: "Zero direct connections to Postgres, Qdrant, or
+# models" — backing that claim with what's actually INSTALLED, not just what's
+# imported, is the point of this file existing at all. Verified structurally in
+# tests/test_mcp_server.py (checks sys.modules after import for anything
+# SQLAlchemy/asyncpg/psycopg/Qdrant-shaped).
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "mcp>=2.0" \
+    "httpx>=0.27" \
+    "pydantic>=2.7" \
+    "pydantic-settings>=2.3" \
+    "uvicorn[standard]>=0.30"
+
+# Only what app.mcp_server actually needs: app.config (settings) and the package
+# itself. Not app/db, app/adapters, app/graph, etc. — none of that is importable in
+# this image (the packages it needs aren't installed), which is intentional.
+COPY app/__init__.py ./app/__init__.py
+COPY app/config.py ./app/config.py
+COPY app/mcp_server ./app/mcp_server
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8001
+
+CMD ["python", "-m", "app.mcp_server.server"]

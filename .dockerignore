@@ -1,0 +1,11 @@
+.venv*
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+.env
+llm-wiki-prd.md
+BUILD_LOG.md
+tests
+*.md

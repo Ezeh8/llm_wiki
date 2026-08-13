@@ -1,0 +1,90 @@
+# PRD Section 9 Step 17 / API-7b: 4 containers (App, Postgres, Qdrant, MCP),
+# 3 persistent volumes (postgres_data, qdrant_data, dead_letter_data).
+#
+# Startup order matters: postgres/qdrant must be healthy before `app` starts (its
+# lifespan provisions the Qdrant collection + checkpointer tables and needs both
+# reachable — Step 17's app.py change). `app` itself will keep failing/restarting
+# until `alembic upgrade head` has been run at least once (that's what creates the
+# restricted DB role `app`'s own DATABASE_URL connects as — Step 1) — this is
+# intentional: migrations are a deliberate manual step (Section 10 Setup
+# Instructions), not auto-run from a container entrypoint.
+#
+# Secrets at runtime: every service reads `.env` via `env_file` — nothing is baked
+# into either image. Copy `.env.example` to `.env` and fill in real values first.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-llm_wiki_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-change-me-admin-password}
+      POSTGRES_DB: ${POSTGRES_DB:-llm_wiki}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-llm_wiki_admin}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - llm_wiki_net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # Qdrant's image has no curl/wget; a bare TCP probe is enough to know it's up.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - llm_wiki_net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - dead_letter_data:${DEAD_LETTER_PATH:-/data/dead-letter}
+    restart: on-failure
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; import sys; sys.exit(0 if u.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - llm_wiki_net
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    env_file: .env
+    depends_on:
+      - app
+    ports:
+      - "8001:8001"
+    restart: on-failure
+    networks:
+      - llm_wiki_net
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  dead_letter_data:
+
+networks:
+  llm_wiki_net:
+    driver: bridge
