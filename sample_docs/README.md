@@ -68,7 +68,7 @@ flowchart TD
 
     Employee -.->|writes updates| Changelog
     Admin -.->|reviews| Changelog
-    Admin -->|pushes accepted updates| API
+    Admin -->|pushes updates| API
     Employee --> API
     Agents --> MCP
     MCP --> API
