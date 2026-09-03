@@ -114,14 +114,14 @@ docker compose run --rm app alembic upgrade head
 docker compose exec app python -m app.create_api_key --tier admin --actor "Your Name"
 
 # 5. Upload your first document
-curl -X POST http://localhost:8000/documents \
+curl -X POST http://localhost:8002/documents \
   -H "X-API-Key: <your-admin-key>" \
   -F "file=@/path/to/doc.md" \
   -F "title=My First SOP" \
   -F "source_label=hr"
 
 # 6. Query it
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8002/query \
   -H "X-API-Key: <your-admin-key>" \
   -H "Content-Type: application/json" \
   -d '{"question": "What does this document say?"}'
